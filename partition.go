@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,8 +63,18 @@ func (pg *partGroup) signal() {
 	}
 }
 
+// eventChunkSize 为内存缺页时从日志一次按需读回的位点批量。
+const eventChunkSize = 64
+
 // partition 维护单个分区的全部事件与有序投递状态。
-// offset 即事件在 events 中的下标，从 0 开始，严格按发布顺序递增。
+//
+// 绝对位点即追加日志行号，从 0 开始严格按发布顺序递增，全程不重用。
+// 内存中只保留一个滑动驻留窗口，常驻内存只与配置上限相关，与累计发布量无关：
+//   - base：保留窗口最小位点。base 之前的事件已被所有消费组确认，事件体可淘汰；
+//   - head：下一条发布事件的位点（= 日志总行数）；
+//   - sizes：[base, head) 内各位点 payload 长度的稠密元数据环，用于无事件体时
+//     仍能精确计算积压字节；
+//   - events：事件体稀疏驻留，未驻留的位点在派发时从日志按块读回（缺页读盘）。
 type partition struct {
 	topic string
 	index int
@@ -73,7 +84,10 @@ type partition struct {
 
 	mu     sync.Mutex
 	cond   *sync.Cond // 发布者背压等待
-	events []Event
+	base   uint64
+	head   uint64
+	sizes  []int            // 下标 off-base：该位点事件的 payload 字节数
+	events map[uint64]Event // 事件体稀疏驻留，缺页时按 eventChunkSize 从日志读入
 	groups map[string]*partGroup
 
 	restored map[string]uint64 // 启动恢复出的 group -> committed
@@ -89,6 +103,7 @@ func newPartition(topic string, index int, cfg Config, store *fileStore, cnt *co
 		cfg:      cfg,
 		store:    store,
 		cnt:      cnt,
+		events:   map[uint64]Event{},
 		groups:   map[string]*partGroup{},
 		restored: restored,
 		stopCh:   make(chan struct{}),
@@ -97,11 +112,50 @@ func newPartition(topic string, index int, cfg Config, store *fileStore, cnt *co
 	return p
 }
 
-// restore 加载落盘事件，必须在启动任何派发器之前调用。
-func (p *partition) restore(events []Event) {
+// restore 重建分区的轻量元数据，必须在启动任何派发器之前调用。
+// base 为恢复时的保留窗口起点（所有已恢复位点的最小值），head 为日志总行数，
+// sizes 为 [base, head) 的 payload 长度；事件体不进内存，派发缺页时再读盘。
+func (p *partition) restore(base, head uint64, sizes []int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.events = events
+	p.base = base
+	p.head = head
+	p.sizes = sizes
+}
+
+// pageInLocked 把从 off 起的一块事件从日志读入内存（调用方持锁）。
+// 仅用于派发需要事件体而该位点当前未驻留的场景；读回不改任何位点语义。
+func (p *partition) pageInLocked(off uint64) error {
+	if off < p.base || off >= p.head {
+		return fmt.Errorf("%w: page in offset %d outside window [%d,%d)",
+			ErrPersistence, off, p.base, p.head)
+	}
+	limit := uint64(eventChunkSize)
+	if rest := p.head - off; rest < limit {
+		limit = rest
+	}
+	loaded, err := p.store.readEvents(p.topic, p.index, off, limit)
+	if err != nil {
+		return err
+	}
+	for _, e := range loaded {
+		p.events[e.Offset] = e
+	}
+	if _, ok := p.events[off]; !ok {
+		return fmt.Errorf("%w: event at offset %d missing after read", ErrPersistence, off)
+	}
+	return nil
+}
+
+// eventLocked 返回某位点的事件体，未驻留时按需从日志读回（调用方持锁）。
+func (p *partition) eventLocked(off uint64) (Event, error) {
+	if ev, ok := p.events[off]; ok {
+		return ev, nil
+	}
+	if err := p.pageInLocked(off); err != nil {
+		return Event{}, err
+	}
+	return p.events[off], nil
 }
 
 // ensureGroup 惰性创建消费组状态并启动其有序派发器。
@@ -112,8 +166,11 @@ func (p *partition) ensureGroup(sink groupSink) *partGroup {
 		return pg
 	}
 	committed := p.restored[sink.groupName()]
-	if committed > uint64(len(p.events)) {
-		committed = uint64(len(p.events))
+	if committed < p.base {
+		committed = p.base
+	}
+	if committed > p.head {
+		committed = p.head
 	}
 	pg := newPartGroup(sink, committed)
 	p.groups[sink.groupName()] = pg
@@ -123,36 +180,45 @@ func (p *partition) ensureGroup(sink groupSink) *partGroup {
 }
 
 // minCommittedLocked 返回所有消费组中最小的已确认位点（决定背压口径）。
+// 尚没有任何消费组（含未实例化的恢复组）时返回 base：未被任何组确认的整段
+// 保留窗口都算积压，因此“没有订阅者”不会让容量判断失效，也不会让内存无界。
 func (p *partition) minCommittedLocked() uint64 {
-	min := uint64(len(p.events))
+	min := p.head
 	first := true
-	for _, pg := range p.groups {
-		if first || pg.committed < min {
-			min = pg.committed
-			first = false
+	consider := func(off uint64) {
+		if off < min {
+			min = off
 		}
+		first = false
+	}
+	for _, pg := range p.groups {
+		consider(pg.committed)
 	}
 	// 尚未实例化但恢复出位点的组同样参与背压计算。
 	for g, off := range p.restored {
 		if _, ok := p.groups[g]; ok {
 			continue
 		}
-		if first || off < min {
-			min = off
-			first = false
-		}
+		consider(off)
+	}
+	if first {
+		return p.base
 	}
 	return min
 }
 
 // backlogLocked 计算未确认事件数与 payload 字节占用（相对最慢消费组）。
+// 字节统计只依赖 sizes 元数据环，事件体是否驻留内存都不影响准确性。
 func (p *partition) backlogLocked() (int, int64) {
 	start := p.minCommittedLocked()
-	var bytes int64
-	for _, e := range p.events[start:] {
-		bytes += int64(len(e.Payload))
+	if start < p.base {
+		start = p.base
 	}
-	return len(p.events) - int(start), bytes
+	var bytes int64
+	for _, n := range p.sizes[start-p.base:] {
+		bytes += int64(n)
+	}
+	return int(p.head - start), bytes
 }
 
 // publish 将已构造好的事件持久化并追加到分区，受背压策略约束。
@@ -188,7 +254,7 @@ func (p *partition) publish(ctx context.Context, e Event) (uint64, error) {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
-		e.Offset = uint64(len(p.events))
+		e.Offset = p.head
 		e.Partition = p.index
 		e.Topic = p.topic
 		// 确定性事件 ID：绑定 (主题,分区,位点)，全局唯一且重启后不变，供消费者幂等去重。
@@ -196,7 +262,9 @@ func (p *partition) publish(ctx context.Context, e Event) (uint64, error) {
 		if err := p.store.appendEvent(e); err != nil {
 			return 0, err // 已是包装后的对外错误
 		}
-		p.events = append(p.events, e)
+		p.sizes = append(p.sizes, len(e.Payload))
+		p.events[e.Offset] = e
+		p.head++
 		p.cnt.published.Add(1)
 		for _, pg := range p.groups {
 			pg.signal()
@@ -226,7 +294,7 @@ func (p *partition) planLocked(pg *partGroup, now time.Time) dispatchPlan {
 		}
 		return dispatchPlan{off: off, full: true}
 	}
-	for off := pg.committed; off < uint64(len(p.events)); off++ {
+	for off := pg.committed; off < p.head; off++ {
 		if _, dead := pg.dead[off]; dead {
 			continue
 		}
@@ -269,7 +337,20 @@ func (p *partition) dispatchLoop(pg *partGroup) {
 		case plan.full:
 			p.mu.Unlock()
 		default:
-			ev := p.events[plan.off]
+			// 事件体可能已因容量控制被淘汰出内存（如重启后的历史事件），
+			// 这里按位点从日志读回；读盘失败不丢事件，短暂退避后在原位点重试。
+			ev, perr := p.eventLocked(plan.off)
+			if perr != nil {
+				timer := time.NewTimer(10 * time.Millisecond)
+				p.mu.Unlock()
+				select {
+				case <-timer.C:
+				case <-p.stopCh:
+					timer.Stop()
+					return
+				}
+				continue
+			}
 			ev.Attempts = plan.attempt
 			pg.inFlight[plan.off] = inflight{attempt: plan.attempt}
 			pg.attempts[plan.off] = plan.attempt
@@ -328,7 +409,34 @@ func (p *partition) advanceLocked(pg *partGroup) (uint64, bool) {
 		delete(pg.retryAt, pg.committed)
 		pg.committed++
 	}
+	// 仅在位点持久化并推进内存簿记后，才淘汰所有组都确认的前缀；
+	// 淘汰是纯粹的容量控制：日志仍在，重启与缺页读回语义均不变。
+	p.evictLocked()
 	return target, true
+}
+
+// evictLocked 把保留窗口起点推进到所有组的最小已确认位点，
+// 释放此前位点的事件体与元数据（纯内存操作，不删除日志，不影响任何组）。
+// 调用方须持锁，且只能在内存 committed 成功推进之后调用。
+func (p *partition) evictLocked() {
+	floor := p.minCommittedLocked()
+	if floor < p.base {
+		floor = p.base
+	}
+	if floor <= p.base {
+		return
+	}
+	drop := int(floor - p.base)
+	for off := p.base; off < floor; off++ {
+		delete(p.events, off)
+	}
+	if drop >= len(p.sizes) {
+		p.sizes = p.sizes[:0]
+	} else {
+		n := copy(p.sizes, p.sizes[drop:])
+		p.sizes = p.sizes[:n]
+	}
+	p.base = floor
 }
 
 // ack 处理确认，返回确认后的连续位点。
@@ -339,7 +447,7 @@ func (p *partition) ack(group string, e Event) (uint64, error) {
 	if !ok {
 		return 0, ErrUnknownGroup
 	}
-	if e.Offset >= uint64(len(p.events)) {
+	if e.Offset >= p.head {
 		return 0, ErrUnknownEvent
 	}
 	st, flying := pg.inFlight[e.Offset]
@@ -384,7 +492,7 @@ func (p *partition) nack(group string, e Event, cause error) (uint64, error) {
 	if !ok {
 		return 0, ErrUnknownGroup
 	}
-	if e.Offset >= uint64(len(p.events)) {
+	if e.Offset >= p.head {
 		return 0, ErrUnknownEvent
 	}
 	st, flying := pg.inFlight[e.Offset]
@@ -412,8 +520,14 @@ func (p *partition) nack(group string, e Event, cause error) (uint64, error) {
 		if cause != nil {
 			reason += ": " + cause.Error()
 		}
+		dlEvent, err := p.eventLocked(e.Offset)
+		if err != nil {
+			// 事件体读不回不能静默吞掉：回滚簿记，消费者可再次 Nack 触发。
+			pg.inFlight[e.Offset] = st
+			return pg.committed, err
+		}
 		dl := DeadLetter{
-			Event:    p.events[e.Offset],
+			Event:    dlEvent,
 			Group:    group,
 			Reason:   reason,
 			Attempts: attempts,
@@ -463,6 +577,20 @@ func (p *partition) committedOffset(group string) uint64 {
 		return pg.committed
 	}
 	return p.restored[group]
+}
+
+// retentionWindow 返回保留窗口 [base, head)（测试与日志用）。
+func (p *partition) retentionWindow() (base, head uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.base, p.head
+}
+
+// residentEvents 返回当前事件体驻留内存的个数（测试与日志用）。
+func (p *partition) residentEvents() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.events)
 }
 
 // closePartition 优雅停机：停止派发，未确认事件留在日志中，重启后重新投递。

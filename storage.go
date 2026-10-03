@@ -86,8 +86,44 @@ func (s *fileStore) appendJSON(path string, v any) error {
 	return nil
 }
 
-// loadEvents 读取分区的全部已落盘事件。
-func (s *fileStore) loadEvents(topic string, partition int) ([]Event, error) {
+// scanPartition 统计分区日志中的事件总数，并返回绝对位点 from 起各事件的
+// payload 长度（返回切片下标 0 即对应 from）。
+// 重启恢复时只重建这份轻量元数据（每事件约一个 int），不把事件体载入内存；
+// 事件体在派发需要时由 readEvents 按需读回。
+// 约定：日志为纯追加，行号即绝对位点，位点从 0 稠密递增。
+func (s *fileStore) scanPartition(topic string, partition int, from uint64) (total uint64, sizes []int, err error) {
+	f, err := os.Open(s.eventsPath(topic, partition))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil, nil
+		}
+		return 0, nil, fmt.Errorf("%w: read events: %v", ErrPersistence, err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024*1024), 16*1024*1024)
+	for sc.Scan() {
+		off := total
+		total++
+		if off < from {
+			continue
+		}
+		var e Event
+		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+			return 0, nil, fmt.Errorf("%w: corrupt event record: %v", ErrPersistence, err)
+		}
+		sizes = append(sizes, len(e.Payload))
+	}
+	if err := sc.Err(); err != nil {
+		return 0, nil, fmt.Errorf("%w: scan events: %v", ErrPersistence, err)
+	}
+	return total, sizes, nil
+}
+
+// readEvents 从绝对位点 from 起读取至多 limit 条事件（含 from）。
+// 用于内存缺页时按需读回历史：日志行号与位点一一对应，跳过前 from 行即可。
+// 到达日志末尾时返回已读到的部分，不算错误。
+func (s *fileStore) readEvents(topic string, partition int, from, limit uint64) ([]Event, error) {
 	f, err := os.Open(s.eventsPath(topic, partition))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -99,12 +135,21 @@ func (s *fileStore) loadEvents(topic string, partition int) ([]Event, error) {
 	var out []Event
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1024*1024), 16*1024*1024)
+	var off uint64
 	for sc.Scan() {
+		if off < from {
+			off++
+			continue
+		}
+		if limit > 0 && uint64(len(out)) >= limit {
+			break
+		}
 		var e Event
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
 			return nil, fmt.Errorf("%w: corrupt event record: %v", ErrPersistence, err)
 		}
 		out = append(out, e)
+		off++
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("%w: scan events: %v", ErrPersistence, err)

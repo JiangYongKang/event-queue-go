@@ -108,10 +108,6 @@ func (b *Broker) recover() error {
 		}
 		t := &topic{name: name, groups: map[string]*consumerGroup{}}
 		for pi := 0; pi < n; pi++ {
-			events, err := b.store.loadEvents(name, pi)
-			if err != nil {
-				return err
-			}
 			restored := map[string]uint64{}
 			for k, off := range offsets {
 				if k.Topic == name && k.Partition == pi {
@@ -119,9 +115,28 @@ func (b *Broker) recover() error {
 				}
 			}
 			p := newPartition(name, pi, b.cfg, b.store, &b.cnt, restored)
-			p.restore(events)
+			// 保留窗口起点取所有已恢复组位点的最小值；没有任何组记录时从 0 起，
+			// 保证“先发布、后订阅”的历史事件重启后仍从头可读、可投递。
+			var base uint64
+			first := true
+			for _, off := range restored {
+				if first || off < base {
+					base = off
+					first = false
+				}
+			}
+			// 只重建轻量元数据（位点 + payload 长度），事件体不进内存，
+			// 常驻内存因此与累计发布量无关；派发缺页时再按块从日志读回。
+			head, sizes, err := b.store.scanPartition(name, pi, base)
+			if err != nil {
+				return err
+			}
+			if base > head {
+				base = head
+			}
+			p.restore(base, head, sizes)
 			t.partitions = append(t.partitions, p)
-			b.cnt.published.Add(uint64(len(events)))
+			b.cnt.published.Add(head)
 		}
 		b.topics[name] = t
 	}

@@ -38,6 +38,46 @@
 - 死信为终态：位点推进越过该事件，分区不会被卡死，且重启后死信不重投。
   不会无限重试，也不会静默丢弃。可通过 `Broker.DeadLetters(topic, group)` 查询。
 
+## 消费端晚到 / 不在场（先发布、后订阅）
+
+生产端可以先启动、先写事件，消费组很久之后才订阅；也允许某些分区长时间没有
+任何消费组。这是一等支持的节奏，语义与“消费者在场”时完全一致：
+
+- **历史不丢、不乱序**：任何已成功 `Publish`（已 fsync）的事件都先落在
+  `events.log` 里。消费组首次订阅时从该分区保留窗口的最早位点（base offset）
+  开始，由“分区 × 组”派发器按 offset 顺序逐条投递历史。即使这些历史事件的
+  **事件体当前并不在内存里**（长跑淘汰或重启后），派发器也会在需要时按块
+  （64 条/次）从日志**缺页读回**再投递；投递之后的顺序、连续前缀位点推进、
+  重试退避、死信与幂等去重（事件 ID 仍绑定 `(topic,partition,offset)`）
+  与实时事件没有任何区别。
+- **重启后同样成立**：恢复时只重建轻量元数据（位点 + 每条 payload 长度），
+  不把事件体载入内存；无订阅者的历史积压重启后依旧可从头读盘投递。
+- **积压口径不依赖订阅者**：没有任何消费组时，未确认积压按**整个保留窗口**
+  计算（最慢消费组的 committed offset 视为 base offset）。因此
+  `MaxBacklogPerPartition` / `MaxMemoryBytes` 在无人订阅、或所有组都已追平时
+  照样生效：Reject 立即返回 `ErrBackpressure` 并计 `Rejected`，Block 照常阻塞，
+  `Broker.Backlog()` 的 `Pending / InFlight / PayloadBytes` 如实反映容量占用。
+
+## 容量与内存语义（常驻内存只随上限，不随累计发布量）
+
+- 分区在内存中维护一个滑动驻留窗口 `[base, head)`：
+  - `head` = 日志总行数（下一条事件位点），`base` = 仍需保留的最早位点；
+  - `sizes` 是窗口内每条 payload 长度的元数据环（每事件约一个 int），
+    因此即便事件体不在内存也能精确统计积压字节；
+  - `events` 只稀疏驻留事件体，缺页（历史事件、重启恢复）时从日志按块读回。
+- 当某段前缀被**所有**消费组连续确认（或死信跳过）且位点已持久化后，
+  该前缀的事件体与元数据被淘汰出内存，`base` 随之推进。这是纯粹的容量控制：
+  - 不删除磁盘日志，不影响重启恢复（恢复只依赖 `events.log` + `offsets.json`）；
+  - 不会把已确认事件重新投给既有消费组；
+  - 不会越过仍在消费的组——淘汰下界取所有组的最小 committed（含未实例化的
+    恢复组），慢组不追平，前缀就不会被淘汰；
+  - 不打乱任何组的位点与顺序。
+- 结论：累计发布量可以远大于上限，常驻内存只与配置的积压/字节上限相关
+  （加上每事件一条等长元数据）；磁盘日志承担完整历史。
+- 新消费组在已有历史被确认淘汰之后才订阅时，从当前 base 开始消费（不会、也
+  无法重放已被所有组确认并淘汰的更早历史）；在淘汰发生之前订阅则从最早
+  历史开始。
+
 ## 持久化与恢复（无半提交）
 
 数据目录布局：
@@ -57,14 +97,16 @@
 
 ## 背压策略
 
-以分区内**最慢消费组**的 committed offset 计算未确认积压：
+以分区内**最慢消费组**的 committed offset 计算未确认积压；**没有任何消费组
+订阅时按整个保留窗口计算**，容量判断不会因订阅者缺席而失效：
 
 - `MaxBacklogPerPartition`：未确认事件数上限。
-- `MaxMemoryBytes`：未确认事件 payload 字节上限。
+- `MaxMemoryBytes`：未确认事件 payload 字节上限（只依赖元数据统计，事件体
+  是否驻留内存都准确）。
 - 策略：
   - `BackpressureReject`：超限立即返回 `ErrBackpressure`，并计入 `Stats.Rejected`；
   - `BackpressureBlock`：`Publish` 阻塞，直到位点推进腾出空间或 `ctx` 取消
-    （返回 ctx 错误，不会死锁）。
+    （返回 ctx 错误，不会死锁）；消费组晚到并确认后，被阻塞的发布会自动放行。
 - 指标：`Broker.Backlog()` 返回每分区 `Pending / InFlight / PayloadBytes`。
   系统不会无界占用内存，也不会悄悄丢弃事件。
 
@@ -131,6 +173,15 @@ go test -v ./...                     # 查看关键位点与判定依据日志
 - `TestDuplicateDeliveryAccepted` / `TestRestartDuplicateAcceptedWithDedup`：
   重复投递幂等接受、计 Duplicates、不产生重复副作用。
 - `TestBackpressureReject` / `TestBackpressureBlock`：拒绝/阻塞策略与积压指标。
+- `TestPublishBeforeSubscribe`：先发布 100 条、消费组晚到后从头按序消费全部
+  历史；无订阅者期间积压/字节指标如实。
+- `TestHistoryDeliveredFromDiskAfterRestart`：无订阅者发布 70 条（>缺页块 64）
+  后重启，恢复时事件体 0 驻留，订阅后经缺页读盘按序投递、位点正常推进。
+- `TestBackpressureWithoutConsumers` / `TestBlockWithoutConsumersReleasedOnLateSubscribe`：
+  完全无消费者时发到接近/超过条数上限与字节上限，拒绝/阻塞行为、`Rejected`
+  计数与指标符合预期；晚到确认后放行。
+- `TestMemoryBoundedOverLongRun`：累计发布 300（远超上限 8），驻留内存始终
+  有界、追平后归零；重启后晚到组不重投已确认历史、只收新事件。
 - `TestRestartRecovery`：未确认事件重启后按序重投、已确认不重投；
   `TestRestartNoRedeliveryAfterAck`、`TestRestartDLQPersistence`：全确认与
   死信场景的恢复正确性。
