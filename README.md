@@ -54,19 +54,57 @@
 - 优雅停机（`Close`）：停止全部派发协程；已确认事件不再投递，**未确认事件
   （含处理中）重启后从已提交位点重新投递**。
 - 重启：扫描目录恢复主题、事件与各消费组位点；DLQ 记录一并恢复。
+  恢复后按确认水位逐出已确认前缀，常驻内存不随历史总量增长。
 
 ## 背压策略
 
-以分区内**最慢消费组**的 committed offset 计算未确认积压：
+以分区内**最慢消费组**的已确认位点（确认水位）计算未确认积压：
 
 - `MaxBacklogPerPartition`：未确认事件数上限。
 - `MaxMemoryBytes`：未确认事件 payload 字节上限。
+- **没有订阅者也算数**：确认水位在无任何消费组（含恢复出位点的组）时视为 0，
+  即全部已发布事件都计入积压。生产端先启动、消费端很久才上线的节奏下，
+  容量判断不会失效，分区不会无界囤积。
 - 策略：
   - `BackpressureReject`：超限立即返回 `ErrBackpressure`，并计入 `Stats.Rejected`；
   - `BackpressureBlock`：`Publish` 阻塞，直到位点推进腾出空间或 `ctx` 取消
     （返回 ctx 错误，不会死锁）。
-- 指标：`Broker.Backlog()` 返回每分区 `Pending / InFlight / PayloadBytes`。
+- 指标：`Broker.Backlog()` 返回每分区 `Pending / InFlight / PayloadBytes`，
+  如实反映当前积压，与事件此刻是否在内存无关。
   系统不会无界占用内存，也不会悄悄丢弃事件。
+
+## 消费端晚到或不在场
+
+生产端可以先启动、先写入，消费组之后任意时刻再订阅，语义与在线消费完全一致：
+
+- **历史不丢不乱**：新消费组从位点 0 开始，按分区顺序把订阅前发布的全部历史
+  事件消费到；位点推进、确认规则、幂等去重（`DedupStore` / `NewDedupHandler`）
+  与在线消费是同一条投递路径。
+- **内存窗口与磁盘回读**：每个分区只在内存保留 `[base, total)` 的滑动窗口；
+  被所有已知消费组确认的旧事件（位点 < 确认水位）会从内存逐出，但仍保留在
+  磁盘日志中。晚到的消费组消费到这段历史时按位点从磁盘回读，投递顺序、
+  `Attempts` 计数、确认与死信语义都不变（回读失败不消耗重试次数，退避后重试）。
+- **内存只与配置上限相关**：逐出是纯容量控制——常驻内存 ≈ 未确认积压，受
+  `MaxBacklogPerPartition` / `MaxMemoryBytes` 约束，不随累计发布量增长；
+  重启时同样按恢复出的确认水位逐出，重开 Broker 不会放大内存。
+- **不影响恢复语义**：逐出不改任何位点与确认簿记；已确认事件重启后绝不重投，
+  未确认事件（无论在内存还是磁盘）重启后仍从已提交位点按序重投。
+
+```go
+// 生产端先跑：没有任何订阅者，事件可靠落盘（受积压上限约束）。
+b.CreateTopic("orders", 4)
+for _, pay := range batch {
+    b.Publish(ctx, "orders", pay.Key, pay.Data) // 超限按策略阻塞/拒绝
+}
+// ……很久以后，消费组才上线：从位点 0 按序消费全部历史，
+// 已逐出内存的部分自动从磁盘回读，用法与在线消费没有任何区别。
+c, _ := b.Subscribe("orders", "billing", "worker-1")
+for {
+    ev, err := c.Poll(ctx)
+    if err != nil { break }
+    if err := h(ctx, ev); err != nil { _ = c.Nack(ev, err) } else { _ = c.Ack(ev) }
+}
+```
 
 ## 可区分的错误
 
@@ -131,6 +169,17 @@ go test -v ./...                     # 查看关键位点与判定依据日志
 - `TestDuplicateDeliveryAccepted` / `TestRestartDuplicateAcceptedWithDedup`：
   重复投递幂等接受、计 Duplicates、不产生重复副作用。
 - `TestBackpressureReject` / `TestBackpressureBlock`：拒绝/阻塞策略与积压指标。
+- 消费端晚到 / 不在场：
+  - `TestLateSubscriberConsumesHistoryInOrder`：先发布 20 条再订阅，
+    晚到组从位点 0 按序消费完全部历史，位点推进与副作用次数正确；
+  - `TestLateSubscriberReadsEvictedHistoryFromDisk`：历史被全部确认并逐出
+    内存后，全新消费组从磁盘回读 [0..29]，严格有序、`Attempts` 全为 1；
+  - `TestNoConsumerBackpressureReject` / `TestNoConsumerBackpressureBlock` /
+    `TestNoConsumerMemoryBytesCap`：完全没有消费者时，条数与字节上限照常
+    拒绝/阻塞，积压与容量指标如实反映，晚到消费者确认后发布恢复；
+  - `TestMemoryBoundedUnderSustainedLoad`：累计发布量 20 倍于上限时，
+    确认前缀持续逐出、内存窗口不随累计量增长；重启后已确认事件不重投、
+    内存不放大，新消费组仍能从磁盘读回全部历史。
 - `TestRestartRecovery`：未确认事件重启后按序重投、已确认不重投；
   `TestRestartNoRedeliveryAfterAck`、`TestRestartDLQPersistence`：全确认与
   死信场景的恢复正确性。

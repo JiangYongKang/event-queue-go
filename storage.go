@@ -86,6 +86,34 @@ func (s *fileStore) appendJSON(path string, v any) error {
 	return nil
 }
 
+// readEvent 按位点从分区日志读回单个事件。
+// 事件日志只增不改，offset 即行号；用于内存窗口已逐出、但消费组仍需从头消费
+// 历史事件时的按需回读（消费端晚到场景）。与并发追加无冲突：只读取已落盘的旧行。
+func (s *fileStore) readEvent(topic string, partition int, offset uint64) (Event, error) {
+	f, err := os.Open(s.eventsPath(topic, partition))
+	if err != nil {
+		return Event{}, fmt.Errorf("%w: open events for read-back: %v", ErrPersistence, err)
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1024*1024), 16*1024*1024)
+	var idx uint64
+	for sc.Scan() {
+		if idx == offset {
+			var e Event
+			if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+				return Event{}, fmt.Errorf("%w: corrupt event record: %v", ErrPersistence, err)
+			}
+			return e, nil
+		}
+		idx++
+	}
+	if err := sc.Err(); err != nil {
+		return Event{}, fmt.Errorf("%w: scan events: %v", ErrPersistence, err)
+	}
+	return Event{}, fmt.Errorf("%w: event offset %d not found in log", ErrPersistence, offset)
+}
+
 // loadEvents 读取分区的全部已落盘事件。
 func (s *fileStore) loadEvents(topic string, partition int) ([]Event, error) {
 	f, err := os.Open(s.eventsPath(topic, partition))
