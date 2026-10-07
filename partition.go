@@ -445,7 +445,7 @@ func (p *partition) ack(group string, e Event) (uint64, error) {
 		p.cnt.acked.Add(^uint64(0))
 		return e.Offset, ErrPersistence
 	}
-	p.evictLocked()  // 已确认前缀释放内存（纯容量控制，不影响位点）
+	p.evictLocked()    // 已确认前缀释放内存（纯容量控制，不影响位点）
 	p.cond.Broadcast() // 释放背压中的发布者
 	pg.signal()        // 队首腾出，唤醒派发器
 	return pg.committed, nil
@@ -475,20 +475,39 @@ func (p *partition) nack(group string, e Event, cause error) (uint64, error) {
 		return pg.committed, ErrOffsetRegression
 	}
 	attempts := pg.attempts[e.Offset]
-	delete(pg.inFlight, e.Offset)
 
 	maxAttempts := p.cfg.Retry.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 1
 	}
 	if attempts >= maxAttempts {
+		// 死信记录必须携带事件本体。晚到消费组补消费时，该位点可能已被确认
+		// 水位逐出内存（offset < base），需按位点从磁盘日志回读，语义与
+		// 内存命中完全一致。回读放在解除在途簿记之前：IO 期间派发器仍会在
+		// 这个在途位点上阻塞，杜绝并发重投。
+		var dlEvent Event
+		if e.Offset >= p.base {
+			dlEvent = p.events[e.Offset-p.base]
+		} else {
+			p.mu.Unlock()
+			loaded, readErr := p.store.readEvent(p.topic, p.index, e.Offset)
+			p.mu.Lock()
+			if readErr != nil {
+				// 回读失败不消耗投递次数：在途簿记原样保留（派发器不会越过
+				// 该位点），事件不丢，消费者可再次 Nack 触发，与死信落盘
+				// 失败的回滚语义一致。
+				return pg.committed, readErr
+			}
+			dlEvent = loaded
+		}
+		delete(pg.inFlight, e.Offset)
 		pg.dead[e.Offset] = struct{}{}
 		reason := "retries exhausted after " + itoa(attempts) + " attempts"
 		if cause != nil {
 			reason += ": " + cause.Error()
 		}
 		dl := DeadLetter{
-			Event:    p.events[e.Offset-p.base], // 在途事件位点 >= 水位，必在内存窗口内
+			Event:    dlEvent,
 			Group:    group,
 			Reason:   reason,
 			Attempts: attempts,
@@ -508,6 +527,7 @@ func (p *partition) nack(group string, e Event, cause error) (uint64, error) {
 		pg.signal()
 		return committed, nil
 	}
+	delete(pg.inFlight, e.Offset)
 	pg.retryAt[e.Offset] = time.Now().Add(backoffFor(p.cfg.Retry, attempts))
 	pg.signal()
 	return pg.committed, nil

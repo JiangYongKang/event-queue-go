@@ -84,6 +84,14 @@
   被所有已知消费组确认的旧事件（位点 < 确认水位）会从内存逐出，但仍保留在
   磁盘日志中。晚到的消费组消费到这段历史时按位点从磁盘回读，投递顺序、
   `Attempts` 计数、确认与死信语义都不变（回读失败不消耗重试次数，退避后重试）。
+- **补历史时重试耗尽与死信**：晚到组从磁盘回读的历史事件，重试 / 死信语义与
+  事件还在内存时完全一致。处理失败按同一退避策略重投（回读本身不计投递次数）；
+  达到 `MaxAttempts` 仍失败时，事件本体（从磁盘日志取，不依赖内存命中）连同
+  失败原因写入 DLQ，位点连续越过该事件继续推进，本分区后续事件正常消费——
+  **不会无限重试、不会卡死分区、进程不会退出**。回读或死信落盘失败时不消耗
+  投递次数、簿记原样保留，消费者可再次 Nack 触发。同分区其他消费组与实时新
+  事件不受影响：各组位点独立推进，死信按组隔离（不会错分），去重计数、死信
+  计数与积压 / 容量指标保持一致。
 - **内存只与配置上限相关**：逐出是纯容量控制——常驻内存 ≈ 未确认积压，受
   `MaxBacklogPerPartition` / `MaxMemoryBytes` 约束，不随累计发布量增长；
   重启时同样按恢复出的确认水位逐出，重开 Broker 不会放大内存。
@@ -157,6 +165,18 @@ go test -race -count=1 ./...        # 全量测试 + 竞态检测
 go test -v ./...                     # 查看关键位点与判定依据日志
 ```
 
+本地复现“补历史时重试耗尽”崩溃与验证修复（修复前下面第一条会因下标下溢
+panic 导致测试进程退出）：
+
+```bash
+go test -v -run TestLateSubscriberHistoryRetryExhaustedToDLQ .
+go test -v -run TestLateSubscriberHistoryMixedRetryAndDLQ .
+```
+
+日志会依次打印：内存窗口腾空（`base=N len=0`）→ 补历史开始的容量判定与
+积压（`Backlog` 中 `Pending/PayloadBytes` 在历史不在内存时仍如实计入）→
+死信写全后各组位点连续推进 → 实时事件后积压归零与全局 `Stats`。
+
 测试覆盖（结果确定、可复现，均使用 `t.TempDir()` 隔离）：
 
 - `TestInOrderDelivery`：3 消费者并行，断言严格按序投递/确认、无丢失。
@@ -174,6 +194,14 @@ go test -v ./...                     # 查看关键位点与判定依据日志
     晚到组从位点 0 按序消费完全部历史，位点推进与副作用次数正确；
   - `TestLateSubscriberReadsEvictedHistoryFromDisk`：历史被全部确认并逐出
     内存后，全新消费组从磁盘回读 [0..29]，严格有序、`Attempts` 全为 1；
+  - `TestLateSubscriberHistoryRetryExhaustedToDLQ`：历史被早到组确认腾空后，
+    晚到组补消费这段“只在磁盘上”的历史且始终失败到重试耗尽——不崩溃、
+    DLQ 可按组查到记录与失败原因、位点连续越过、实时事件继续消费，同分区
+    其他组的位点 / 去重 / 计数不受影响（修复前该路径会因内存窗口下标下溢
+    panic 而使整个进程退出）；
+  - `TestLateSubscriberHistoryMixedRetryAndDLQ`：磁盘历史上任意中间位点
+    耗尽进死信、另一位点失败两次后按退避重投成功，位点连续越过、投递次数
+    与退避等待符合策略，不无限重试也不卡死分区；
   - `TestNoConsumerBackpressureReject` / `TestNoConsumerBackpressureBlock` /
     `TestNoConsumerMemoryBytesCap`：完全没有消费者时，条数与字节上限照常
     拒绝/阻塞，积压与容量指标如实反映，晚到消费者确认后发布恢复；
