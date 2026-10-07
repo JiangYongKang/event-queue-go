@@ -80,7 +80,7 @@ type partition struct {
 	events []Event    // 内存窗口，覆盖位点 [base, base+len(events))
 	groups map[string]*partGroup
 
-	evictedBytes int64 // 已逐出事件（位点 < base）的 payload 总字节，用于积压字节核算
+	evictedSizes []int // 已逐出事件各位点（下标即 offset）的 payload 大小，用于积压字节回算
 
 	restored map[string]uint64 // 启动恢复出的 group -> committed
 	closed   bool
@@ -164,6 +164,8 @@ func (p *partition) ackHorizonLocked() uint64 {
 // evictLocked 逐出所有已知消费组都已确认的事件（位点 < 确认水位）。
 // 纯容量控制：事件仍在磁盘日志中，位点与确认簿记不受影响；
 // 晚到的消费组可从磁盘回读这段历史。在途事件位点 >= 水位，绝不会被逐出。
+// 逐出时按位点保留 payload 大小：晚到组补历史期间确认水位落在 (0, base)，
+// 积压字节必须只统计该组尚未确认的逐出区间，而不是整段历史。
 func (p *partition) evictLocked() {
 	horizon := p.ackHorizonLocked()
 	if horizon <= p.base {
@@ -174,7 +176,13 @@ func (p *partition) evictLocked() {
 		n = len(p.events)
 	}
 	for i := 0; i < n; i++ {
-		p.evictedBytes += int64(len(p.events[i].Payload))
+		off := p.base + uint64(i)
+		if int(off) >= len(p.evictedSizes) {
+			grown := make([]int, off+1)
+			copy(grown, p.evictedSizes)
+			p.evictedSizes = grown
+		}
+		p.evictedSizes[off] = len(p.events[i].Payload)
 	}
 	// 拷贝到新切片，释放旧底层数组，常驻内存不随累计发布量增长。
 	rest := make([]Event, len(p.events)-n)
@@ -184,8 +192,9 @@ func (p *partition) evictLocked() {
 }
 
 // backlogLocked 计算未确认事件数与 payload 字节占用（相对最慢消费组）。
-// 已逐出但未确认（仅“全新消费组从 0 订阅”一种情形）的部分用 evictedBytes 补足，
-// 指标如实反映积压，与事件是否在内存无关。
+// 已逐出但未确认的历史部分（含晚到组补历史中途水位落在 (0, base) 的情形）
+// 按位点用逐出时保留的 payload 大小逐段求和，指标如实反映积压，
+// 与事件是否还在内存无关，也不会把已确认前缀重复计入而误触字节容量。
 func (p *partition) backlogLocked() (int, int64) {
 	start := p.ackHorizonLocked()
 	total := p.totalLocked()
@@ -195,8 +204,13 @@ func (p *partition) backlogLocked() (int, int64) {
 	var bytes int64
 	from := start
 	if from < p.base {
-		// start 必为 0（其余情形的 committed 都不小于 base）：逐出部分全部未确认。
-		bytes = p.evictedBytes
+		end := p.base
+		if uint64(len(p.evictedSizes)) < end {
+			end = uint64(len(p.evictedSizes))
+		}
+		for off := start; off < end; off++ {
+			bytes += int64(p.evictedSizes[off])
+		}
 		from = p.base
 	}
 	for _, e := range p.events[from-p.base:] {
@@ -445,10 +459,27 @@ func (p *partition) ack(group string, e Event) (uint64, error) {
 		p.cnt.acked.Add(^uint64(0))
 		return e.Offset, ErrPersistence
 	}
-	p.evictLocked()  // 已确认前缀释放内存（纯容量控制，不影响位点）
+	p.evictLocked()    // 已确认前缀释放内存（纯容量控制，不影响位点）
 	p.cond.Broadcast() // 释放背压中的发布者
 	pg.signal()        // 队首腾出，唤醒派发器
 	return pg.committed, nil
+}
+
+// eventForDLQLocked 取位点对应事件的原貌用于死信记录（调用时持有 p.mu）。
+// 内存窗口命中直接返回；已逐出内存的历史事件按位点从磁盘日志回读。
+// 回读失败返回 ok=false，调用方必须回滚簿记并保留在途状态。
+func (p *partition) eventForDLQLocked(off uint64) (Event, bool) {
+	if off >= p.base {
+		idx := off - p.base
+		if idx < uint64(len(p.events)) {
+			return p.events[idx], true
+		}
+	}
+	loaded, err := p.store.readEvent(p.topic, p.index, off)
+	if err != nil {
+		return Event{}, false
+	}
+	return loaded, true
 }
 
 // nack 处理失败：记录退避重试；次数耗尽则写入死信并携带原因。
@@ -487,8 +518,19 @@ func (p *partition) nack(group string, e Event, cause error) (uint64, error) {
 		if cause != nil {
 			reason += ": " + cause.Error()
 		}
+		// 构造死信需要事件原貌。补历史的晚到组在途位点可能已被逐出内存
+		// （offset < base），直接做 events[offset-base] 会无符号下溢越界 panic；
+		// 与派发路径一致，内存未命中时按位点从磁盘日志回读，语义完全相同。
+		orig, ok := p.eventForDLQLocked(e.Offset)
+		if !ok {
+			// 回读失败：恢复在途簿记，把 Nack 错误返回给消费者，事件保持可重试；
+			// 不落半截死信、不推进位点，更不能让进程退出。
+			delete(pg.dead, e.Offset)
+			pg.inFlight[e.Offset] = st
+			return pg.committed, ErrPersistence
+		}
 		dl := DeadLetter{
-			Event:    p.events[e.Offset-p.base], // 在途事件位点 >= 水位，必在内存窗口内
+			Event:    orig,
 			Group:    group,
 			Reason:   reason,
 			Attempts: attempts,

@@ -84,6 +84,22 @@
   被所有已知消费组确认的旧事件（位点 < 确认水位）会从内存逐出，但仍保留在
   磁盘日志中。晚到的消费组消费到这段历史时按位点从磁盘回读，投递顺序、
   `Attempts` 计数、确认与死信语义都不变（回读失败不消耗重试次数，退避后重试）。
+- **补历史时重试耗尽**：晚到组补的历史事件可能一条都不在内存里，它的失败重试
+  与死信语义和事件还在内存时**完全一致**：未到 `MaxAttempts` 时照常按指数退避
+  重投（`Attempts` 版本号、重复确认、位点回退等判定不变）；重试耗尽后按位点
+  从磁盘日志回读事件原貌写入 DLQ，死信记录同样包含事件本体、消费组、尝试次数、
+  失败时间与可查询原因。随后已确认/死信前缀连续推进，位点正常越过这条死信，
+  本分区后续事件（含补历史期间到达的实时新事件）继续被消费，进程不会退出。
+  无论耗尽的是这段历史的第一条还是任意一条、无论该组落后多少、内存里是否一条
+  历史都不剩，都不会崩、不会无限重试、也不会把分区卡死。死信记录按消费组隔离，
+  不会错分到同分区的其他组；其他组的位点推进、幂等计数与 DLQ 计数互不影响。
+  （磁盘回读本身失败时不写半截死信：回滚本轮簿记、事件保持在途，消费者再次
+  `Nack` 即可重试，错误以 `ErrPersistence` 返回。）
+- **补历史期间的积压与容量指标**：积压始终按最慢消费组真实未确认区间核算。
+  晚到组补历史中途其已提交位点会落在内存窗口起点之前（`0 < committed < base`），
+  已逐出区间的字节数只累加该组**尚未确认**的各位点 payload，不会把它已经确认的
+  前缀重复计入；因此补历史不会让 `Backlog().PayloadBytes` 虚高，也不会在真实
+  积压未达 `MaxMemoryBytes` 时误触背压、误拒实时发布。
 - **内存只与配置上限相关**：逐出是纯容量控制——常驻内存 ≈ 未确认积压，受
   `MaxBacklogPerPartition` / `MaxMemoryBytes` 约束，不随累计发布量增长；
   重启时同样按恢复出的确认水位逐出，重开 Broker 不会放大内存。
@@ -157,6 +173,24 @@ go test -race -count=1 ./...        # 全量测试 + 竞态检测
 go test -v ./...                     # 查看关键位点与判定依据日志
 ```
 
+复现并验证“补历史时重试耗尽”这条崩溃路径：
+
+```bash
+# 稳定复现用例（先腾空内存、再让晚到组补历史且始终失败）：
+go test -v -run TestLateSubscriberHistoryRetryExhaustedToDLQ ./...
+go test -v -run TestLateSubscriberHistoryMiddleDeadLetterNoFalseBackpressure ./...
+```
+
+复现步骤与预期：早到组先把一批历史全部 Ack（内存窗口随之腾空，事件只在
+`events.log`）；再用全新消费组订阅同主题并对历史事件一直返回错误。
+修复前，第一条历史重试耗尽、队列构造死信时会用越界下标访问已腾空的内存窗口，
+`panic: runtime error: index out of range` 直接终止整个测试/服务进程；
+修复后该事件按位点从磁盘回读原貌落入 `dlq.log`，可通过
+`Broker.DeadLetters(topic, group)` 查到记录与失败原因，committed 位点越过它
+继续推进，后续历史与实时事件照常消费，`Stats.DeadLettered/Retried/Rejected`
+与 `Broker.Backlog()` 均符合预期。测试的 `-v` 日志按阶段打印内存窗口、
+`Backlog`（含容量判定：Pending/上限、PayloadBytes/上限）与各组 committed 位点。
+
 测试覆盖（结果确定、可复现，均使用 `t.TempDir()` 隔离）：
 
 - `TestInOrderDelivery`：3 消费者并行，断言严格按序投递/确认、无丢失。
@@ -174,6 +208,15 @@ go test -v ./...                     # 查看关键位点与判定依据日志
     晚到组从位点 0 按序消费完全部历史，位点推进与副作用次数正确；
   - `TestLateSubscriberReadsEvictedHistoryFromDisk`：历史被全部确认并逐出
     内存后，全新消费组从磁盘回读 [0..29]，严格有序、`Attempts` 全为 1；
+  - `TestLateSubscriberHistoryRetryExhaustedToDLQ`：早到组确认 6 条历史、
+    内存窗口腾空后晚到组才订阅补历史，历史 offset 0（第一条）与 offset 3
+    （任意一条）始终失败到 `MaxAttempts=3` 耗尽；断言进程不崩、两条死信可按组
+    查到且携带事件原貌（从磁盘回读的 ID/payload）与失败原因、位点连续越过死信
+    推进到最新、补历史期间一条失败一次再成功的事件按退避正常重投、严格按序、
+    同分区早到组与实时新事件不受影响（投递/确认/重试/死信/去重/拒绝计数精确）；
+  - `TestLateSubscriberHistoryMiddleDeadLetterNoFalseBackpressure`：死信落在
+    历史中间（offset 2，非首条）、组落后 8 条且内存一条历史不剩时不崩、位点
+    越过中间死信；补历史期间字节容量只按真实未确认积压判定，实时发布零误拒；
   - `TestNoConsumerBackpressureReject` / `TestNoConsumerBackpressureBlock` /
     `TestNoConsumerMemoryBytesCap`：完全没有消费者时，条数与字节上限照常
     拒绝/阻塞，积压与容量指标如实反映，晚到消费者确认后发布恢复；
